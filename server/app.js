@@ -13,6 +13,7 @@ const { Pool } = pg;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const isProduction = process.env.NODE_ENV === 'production';
+const isVercel = Boolean(process.env.VERCEL);
 const PORT = Number(process.env.PORT || 8787);
 const MAX_BODY = process.env.MAX_BODY || '512kb';
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -43,7 +44,7 @@ const pool = process.env.DATABASE_URL
   ? new Pool({
       connectionString: process.env.DATABASE_URL,
       ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false },
-      max: Number(process.env.DB_POOL_MAX || 10),
+      max: Number(process.env.DB_POOL_MAX || (isVercel ? 1 : 10)),
       idleTimeoutMillis: 30_000,
       connectionTimeoutMillis: 5_000
     })
@@ -234,12 +235,8 @@ app.patch('/api/connections/:id', async (req, res) => {
     );
     const connection = existing.rows[0];
     if (!connection) return res.status(404).json({ error: 'Connection not found.' });
-    if (connection.addressee_id !== userId) {
-      return res.status(403).json({ error: 'Only the receiver can accept or reject this request.' });
-    }
-    if (connection.status !== 'pending') {
-      return res.status(409).json({ error: `This request is already ${connection.status}.` });
-    }
+    if (connection.addressee_id !== userId) return res.status(403).json({ error: 'Only the receiver can accept or reject this request.' });
+    if (connection.status !== 'pending') return res.status(409).json({ error: `This request is already ${connection.status}.` });
 
     const { rows } = await pool.query(
       `update connections set status=$1, updated_at=now() where id=$2 and addressee_id=$3 and status='pending' returning *`,
@@ -276,39 +273,29 @@ app.post('/api/messages', async (req, res) => {
   const senderId = req.body?.senderId;
   const recipientId = req.body?.recipientId;
   const body = cleanText(req.body?.body, 4000);
-  if (!validUuid(senderId) || !validUuid(recipientId) || !body || senderId === recipientId) {
-    return res.status(400).json({ error: 'Invalid message.' });
-  }
+  if (!validUuid(senderId) || !validUuid(recipientId) || !body || senderId === recipientId) return res.status(400).json({ error: 'Invalid message.' });
   const client = await pool.connect();
   try {
-    if (!await requireAcceptedConnection(client, senderId, recipientId)) {
-      return res.status(403).json({ error: 'Messaging is available only after a mutual connection.' });
-    }
+    if (!await requireAcceptedConnection(client, senderId, recipientId)) return res.status(403).json({ error: 'Messaging is available only after a mutual connection.' });
     const { rows } = await client.query(
-      `insert into messages (id, sender_id, recipient_id, body, delivered_at)
-       values ($1,$2,$3,$4,now()) returning *`, [crypto.randomUUID(), senderId, recipientId, body]
+      `insert into messages (id, sender_id, recipient_id, body, delivered_at) values ($1,$2,$3,$4,now()) returning *`,
+      [crypto.randomUUID(), senderId, recipientId, body]
     );
     res.status(201).json(rows[0]);
   } catch (err) {
     console.error('message post error:', err);
     res.status(500).json({ error: 'Could not send message.' });
-  } finally {
-    client.release();
-  }
+  } finally { client.release(); }
 });
 
-if (!process.env.VERCEL) {
+if (!isVercel) {
   app.use(express.static(path.join(__dirname, '..', 'dist'), { maxAge: isProduction ? '1h' : 0 }));
   app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, '..', 'dist', 'index.html')));
 }
 
 app.use((err, _req, res, _next) => {
-  if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(413).json({ error: 'File is too large. Maximum size is 5 MB.' });
-  }
-  if (err?.type === 'entity.too.large') {
-    return res.status(413).json({ error: `Request is too large. Maximum body size is ${MAX_BODY}.` });
-  }
+  if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File is too large. Maximum size is 5 MB.' });
+  if (err?.type === 'entity.too.large') return res.status(413).json({ error: `Request is too large. Maximum body size is ${MAX_BODY}.` });
   console.error('unhandled error:', err);
   res.status(500).json({ error: 'Internal server error.' });
 });
