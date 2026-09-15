@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: groq-chat-demo
+    runtime: node
+    buildCommand: npm install --no-audit --no-fund && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: VITE_TRIGGER_WORD
+        value: /unlock-node
