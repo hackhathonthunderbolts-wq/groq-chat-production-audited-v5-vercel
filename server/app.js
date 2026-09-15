@@ -138,8 +138,6 @@ app.post('/api/session', async (req, res) => {
   }
 });
 
-// Return one logical connection per pair. The old implementation returned both
-// reciprocal rows after a mutual handshake, which produced duplicate contacts.
 app.get('/api/connections/:userId', async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database is not configured.' });
   if (!validUuid(req.params.userId)) return res.status(400).json({ error: 'Invalid user id.' });
@@ -172,55 +170,45 @@ app.post('/api/connections', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    // Serialize the pair so two users submitting their links at the same time
-    // cannot both miss the reciprocal pending row.
     const pairKey = [requesterId, addresseeId].sort().join(':');
     await client.query('select pg_advisory_xact_lock(hashtextextended($1, 0))', [pairKey]);
 
-    const users = await client.query(
-      'select id from users where id = any($1::uuid[])',
-      [[requesterId, addresseeId]]
-    );
+    const users = await client.query('select id from users where id = any($1::uuid[])', [[requesterId, addresseeId]]);
     if (users.rows.length !== 2) {
       await client.query('ROLLBACK');
       return res.status(404).json({ error: 'The sender link belongs to a session that has not been initialized yet.' });
     }
 
-    // Reusing a previous declined request should create a fresh pending state.
     await client.query(
       `insert into connections (requester_id, addressee_id, status)
        values ($1, $2, 'pending')
        on conflict (requester_id, addressee_id)
        do update set status = case when connections.status='declined' then 'pending' else connections.status end,
-                     updated_at = now()`,
-      [requesterId, addresseeId]
+                     updated_at = now()`, [requesterId, addresseeId]
     );
 
     const reciprocal = await client.query(
-      `select id from connections
-       where requester_id=$1 and addressee_id=$2 and status='pending'
-       limit 1`, [addresseeId, requesterId]
+      `select id from connections where requester_id=$1 and addressee_id=$2 and status='pending' limit 1`,
+      [addresseeId, requesterId]
     );
 
     if (reciprocal.rows[0]) {
       await client.query(
         `update connections set status='accepted', updated_at=now()
-         where (requester_id=$1 and addressee_id=$2)
-            or (requester_id=$2 and addressee_id=$1)`, [requesterId, addresseeId]
+         where (requester_id=$1 and addressee_id=$2) or (requester_id=$2 and addressee_id=$1)`,
+        [requesterId, addresseeId]
       );
       const { rows } = await client.query(
-        `select id, requester_id, addressee_id, status, created_at, updated_at
-         from connections
-         where requester_id=$1 and addressee_id=$2
-         limit 1`, [requesterId, addresseeId]
+        `select id, requester_id, addressee_id, status, created_at, updated_at from connections
+         where requester_id=$1 and addressee_id=$2 limit 1`, [requesterId, addresseeId]
       );
       await client.query('COMMIT');
       return res.json({ connection: rows[0], mutual: true });
     }
 
     const { rows } = await client.query(
-      `select id, requester_id, addressee_id, status, created_at, updated_at
-       from connections where requester_id=$1 and addressee_id=$2 limit 1`, [requesterId, addresseeId]
+      `select id, requester_id, addressee_id, status, created_at, updated_at from connections
+       where requester_id=$1 and addressee_id=$2 limit 1`, [requesterId, addresseeId]
     );
     await client.query('COMMIT');
     res.json({ connection: rows[0], mutual: false });
@@ -233,31 +221,31 @@ app.post('/api/connections', async (req, res) => {
   }
 });
 
-// Kept for compatibility, but acceptance is now only valid when the reciprocal
-// link submission exists. This prevents the old one-click path from bypassing
-// the new mutual-link requirement.
 app.patch('/api/connections/:id', async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database is not configured.' });
-  if (!validUuid(req.params.id) || !['accepted', 'declined'].includes(req.body?.status)) {
+  const status = req.body?.status;
+  const userId = req.body?.userId;
+  if (!validUuid(req.params.id) || !['accepted', 'declined'].includes(status) || !validUuid(userId)) {
     return res.status(400).json({ error: 'Invalid connection update.' });
   }
   try {
-    if (req.body.status === 'accepted') {
-      const { rows } = await pool.query(
-        `select requester_id, addressee_id from connections where id=$1 limit 1`, [req.params.id]
-      );
-      if (!rows[0]) return res.status(404).json({ error: 'Connection not found.' });
-      const mutual = await pool.query(
-        `select 1 from connections where requester_id=$1 and addressee_id=$2 and status='pending' limit 1`,
-        [rows[0].addressee_id, rows[0].requester_id]
-      );
-      if (!mutual.rows[0]) return res.status(409).json({ error: 'Both users must submit each other’s sender link first.' });
-    }
-    const { rows } = await pool.query(
-      `update connections set status=$1, updated_at=now() where id=$2 returning *`,
-      [req.body.status, req.params.id]
+    const existing = await pool.query(
+      `select id, requester_id, addressee_id, status from connections where id=$1 limit 1`, [req.params.id]
     );
-    if (!rows[0]) return res.status(404).json({ error: 'Connection not found.' });
+    const connection = existing.rows[0];
+    if (!connection) return res.status(404).json({ error: 'Connection not found.' });
+    if (connection.addressee_id !== userId) {
+      return res.status(403).json({ error: 'Only the receiver can accept or reject this request.' });
+    }
+    if (connection.status !== 'pending') {
+      return res.status(409).json({ error: `This request is already ${connection.status}.` });
+    }
+
+    const { rows } = await pool.query(
+      `update connections set status=$1, updated_at=now() where id=$2 and addressee_id=$3 and status='pending' returning *`,
+      [status, req.params.id, userId]
+    );
+    if (!rows[0]) return res.status(409).json({ error: 'The connection request changed before it could be updated.' });
     res.json(rows[0]);
   } catch (err) {
     console.error('connection patch error:', err);
@@ -273,8 +261,7 @@ app.get('/api/messages/:userId/:otherId', async (req, res) => {
     if (!await requireAcceptedConnection(pool, userId, otherId)) return res.status(403).json({ error: 'Messaging is available only after a mutual connection.' });
     const { rows } = await pool.query(
       `select id, sender_id, recipient_id, body, created_at, delivered_at, read_at
-       from messages
-       where (sender_id=$1 and recipient_id=$2) or (sender_id=$2 and recipient_id=$1)
+       from messages where (sender_id=$1 and recipient_id=$2) or (sender_id=$2 and recipient_id=$1)
        order by created_at asc limit 200`, [userId, otherId]
     );
     res.json(rows);
@@ -310,11 +297,6 @@ app.post('/api/messages', async (req, res) => {
   }
 });
 
-// On Vercel, the frontend is served as a separate static deployment and only
-// /api/* requests are routed to this app, so the static/catch-all handlers
-// below are skipped there (and there's no local `dist` folder bundled with
-// the serverless function anyway). Traditional hosts (Render, local `npm start`)
-// still get the app serving its own built frontend.
 if (!process.env.VERCEL) {
   app.use(express.static(path.join(__dirname, '..', 'dist'), { maxAge: isProduction ? '1h' : 0 }));
   app.get('/{*splat}', (_req, res) => res.sendFile(path.join(__dirname, '..', 'dist', 'index.html')));
