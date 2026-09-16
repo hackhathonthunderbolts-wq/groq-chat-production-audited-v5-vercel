@@ -20,6 +20,17 @@ create table if not exists connections (
   unique(requester_id, addressee_id)
 );
 
+create table if not exists connection_codes (
+  code char(4) primary key check (code ~ '^[0-9]{4}$'),
+  user_id uuid not null references users(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null default (now() + interval '10 minutes'),
+  used_at timestamptz
+);
+
+create index if not exists connection_codes_user_idx on connection_codes(user_id, expires_at desc);
+create index if not exists connection_codes_active_idx on connection_codes(expires_at) where used_at is null;
+
 create table if not exists messages (
   id uuid primary key default gen_random_uuid(),
   sender_id uuid not null references users(id) on delete cascade,
